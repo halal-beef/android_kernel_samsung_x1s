@@ -36,6 +36,8 @@
 #include <linux/highmem.h>
 #include <linux/io.h>
 #include <linux/kmemleak.h>
+#include <linux/sched.h>
+#include <linux/jiffies.h>
 #include <trace/events/cma.h>
 
 #include "cma.h"
@@ -381,7 +383,6 @@ err:
 	return ret;
 }
 
-#ifdef CONFIG_CMA_DEBUG
 static void cma_debug_show_areas(struct cma *cma)
 {
 	unsigned long next_zero_bit, next_set_bit, nr_zero;
@@ -406,9 +407,6 @@ static void cma_debug_show_areas(struct cma *cma)
 	pr_cont("=> %lu free of %lu total pages\n", nr_total, cma->count);
 	mutex_unlock(&cma->lock);
 }
-#else
-static inline void cma_debug_show_areas(struct cma *cma) { }
-#endif
 
 /**
  * cma_alloc() - allocate pages from contiguous area
@@ -427,9 +425,10 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align,
 	unsigned long pfn = -1;
 	unsigned long start = 0;
 	unsigned long bitmap_maxno, bitmap_no, bitmap_count;
-	size_t i;
 	struct page *page = NULL;
 	int ret = -ENOMEM;
+	int num_attempts = 0;
+	int max_retries = 5;
 
 	if (!cma || !cma->count)
 		return NULL;
@@ -454,8 +453,28 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align,
 				bitmap_maxno, start, bitmap_count, mask,
 				offset);
 		if (bitmap_no >= bitmap_maxno) {
-			mutex_unlock(&cma->lock);
-			break;
+			if ((num_attempts < max_retries) && (ret == -EBUSY)) {
+				mutex_unlock(&cma->lock);
+
+				if (fatal_signal_pending(current))
+					break;
+
+				/*
+				 * Page may be momentarily pinned by some other
+				 * process which has been scheduled out, e.g.
+				 * in exit path, during unmap call, or process
+				 * fork and so cannot be freed there. Sleep
+				 * for 100ms and retry the allocation.
+				 */
+				start = 0;
+				ret = -ENOMEM;
+				schedule_timeout_killable(msecs_to_jiffies(100));
+				num_attempts++;
+				continue;
+			} else {
+				mutex_unlock(&cma->lock);
+				break;
+			}
 		}
 		bitmap_set(cma->bitmap, bitmap_no, bitmap_count);
 		/*
@@ -486,16 +505,6 @@ struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align,
 	}
 
 	trace_cma_alloc(pfn, page, count, align);
-
-	/*
-	 * CMA can allocate multiple page blocks, which results in different
-	 * blocks being marked with different tags. Reset the tags to ignore
-	 * those page blocks.
-	 */
-	if (page) {
-		for (i = 0; i < count; i++)
-			page_kasan_tag_reset(page + i);
-	}
 
 	if (ret && !no_warn) {
 		pr_err("%s: alloc failed, req-size: %zu pages, ret: %d\n",
